@@ -1,0 +1,932 @@
+// SPDX-License-Identifier: MIT
+// WasteSupplyChain Contract for managing a waste supply chain system.
+
+use starknet::ContractAddress;
+use core::integer::{u256, i128};
+use starknet::storage_access::*;
+use starknet::storage::*;
+
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+pub enum WasteType {
+    PAPER,
+    #[default]
+    PETPLASTIC,
+    PLASTIC,
+    METAL,
+    GLASS,
+}
+
+#[derive(Copy, Drop, Serde, starknet::Store, PartialEq)]
+pub enum ParticipantRole {
+    #[default]
+    RECYCLER,
+    COLLECTOR,
+    MANUFACTURER,
+}
+
+#[derive(Copy, Drop, Serde, starknet::Store)]
+pub struct Waste {
+    waste_id: u256,
+    waste_type: WasteType,
+    weight: u256,
+    current_owner: ContractAddress,
+    latitude: i128, 
+    longitude: i128, 
+    recycled_timestamp: u64,
+    is_active: bool,
+    is_confirmed: bool,
+    confirmer: ContractAddress,
+}
+
+#[derive(Copy, Drop, Serde, starknet::Store)]
+pub struct TransferRecord {
+    waste_id: u256,
+    from: ContractAddress,
+    to: ContractAddress,
+    timestamp: u64,
+    latitude: i128, 
+    longitude: i128, 
+    notes: felt252,
+}
+
+#[derive(Copy, Drop, Serde, starknet::Store)]
+pub struct Participant {
+    role: ParticipantRole,
+    name: felt252,
+    latitude: i128, 
+    longitude: i128, 
+    is_registered: bool,
+    total_waste_processed: u256,
+    total_tokens_earned: u256,
+}
+
+#[derive(Copy, Drop, Serde, starknet::Store)]
+pub struct Incentive {
+    waste_type: WasteType,
+    reward: u256,
+    max_waste_amount: u256,
+    rewarder: ContractAddress,
+    is_active: bool,
+}
+
+#[starknet::interface]
+pub trait IERC20<TState> {
+    fn total_supply(self: @TState) -> u256;
+    fn balance_of(self: @TState, account: starknet::ContractAddress) -> u256;
+    fn allowance(self: @TState, owner: starknet::ContractAddress, spender: starknet::ContractAddress) -> u256;
+    fn transfer(ref self: TState, recipient: starknet::ContractAddress, amount: u256) -> bool;
+    fn transfer_from(
+        ref self: TState, sender: starknet::ContractAddress, recipient: starknet::ContractAddress, amount: u256
+    ) -> bool;
+    fn approve(ref self: TState, spender: starknet::ContractAddress, amount: u256) -> bool;
+    // These functions are included as they are commonly part of ERC20 and used in dispatcher examples.
+    fn name(self: @TState) -> felt252;
+    fn symbol(self: @TState) -> felt252;
+    fn decimals(self: @TState) -> u8;
+}
+
+#[starknet::interface]
+pub trait IWasteSupplyChain<TContractState> {
+    fn register_participant(
+        ref self: TContractState,
+        role: ParticipantRole,
+        name: felt252,
+        latitude: i128,
+        longitude: i128
+    );
+
+    fn set_incentive(
+        ref self: TContractState,
+        waste_type: WasteType,
+        reward: u256,
+        max_amount: u256
+    );
+
+    fn update_incentive(
+        ref self: TContractState,
+        incentive_id: u256,
+        new_reward: u256,
+        new_max_amount: u256
+    );
+
+    fn deactivate_incentive(ref self: TContractState, incentive_id: u256);
+
+    fn confirm_waste_details(ref self: TContractState, waste_id: u256);
+
+    fn reset_waste_details(ref self: TContractState, waste_id: u256);
+
+    fn deactivate_waste(ref self: TContractState, waste_id: u256);
+
+    fn recycle_waste(
+        ref self: TContractState,
+        waste_type: WasteType,
+        weight: u256,
+        latitude: i128,
+        longitude: i128
+    ) -> u256;
+
+    fn transfer_waste(
+        ref self: TContractState,
+        waste_id: u256,
+        to: ContractAddress,
+        latitude: i128,
+        longitude: i128,
+        notes: felt252
+    );
+
+    fn transfer_collected_waste(
+        ref self: TContractState,
+        waste_type: WasteType,
+        to: ContractAddress,
+        latitude: i128,
+        longitude: i128,
+        notes: felt252
+    );
+
+    fn donate_to_charity(ref self: TContractState, amount: u256);
+    fn set_charity_contract(ref self: TContractState, new_charity: ContractAddress);
+    fn set_percentage(ref self: TContractState, owner_percent: u256, collector_percent: u256);
+
+    // View functions
+    fn get_waste(self: @TContractState, waste_id: u256) -> Waste;
+    fn get_participant_wastes(self: @TContractState, participant: ContractAddress) -> Array<Waste>;
+    fn get_waste_transfer_history(self: @TContractState, waste_id: u256) -> Array<TransferRecord>;
+    fn get_participant_info(self: @TContractState, participant: ContractAddress) -> Participant;
+    fn get_incentives(self: @TContractState, waste_type: WasteType) -> Array<Incentive>;
+    fn get_incentive(self: @TContractState, incentive_id: u256) -> Incentive;
+    fn get_manufacturer_incentive(self: @TContractState, manufacturer: ContractAddress, waste_type: WasteType) -> Array<Incentive>;
+    fn get_metrics(self: @TContractState) -> (u256, u256);
+    fn get_waste_type_string(self: @TContractState, waste_type: WasteType) -> ByteArray;
+    fn get_participant_role_string(self: @TContractState, role: ParticipantRole) -> ByteArray;
+    fn get_supply_chain_stats(self: @TContractState) -> (u256, u256, u256);
+}
+
+#[starknet::contract]
+pub mod WasteSupplyChain {
+
+    use super::{
+        Waste, TransferRecord, Participant, Incentive, WasteType, ParticipantRole
+    };
+    use starknet::{
+        ContractAddress, get_caller_address, get_block_timestamp, contract_address_const
+    };
+    use starknet::storage_access::*;
+    use starknet::storage::*;
+    use starknet::map::*;
+    use core::{
+        integer::{i128, u256},
+        traits::{Into,TryInto},
+        array::{ArrayTrait, Array},
+        num::traits::Zero
+    };
+
+    use openzeppelin::{
+        token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait},
+        access::{
+            ownable::OwnableComponent
+        },
+        security::{
+            reentrancyguard::ReentrancyGuardComponent
+        }
+    };
+
+    component!(path: OwnableComponent, storage: ownable, event: OwnableEvent);
+    component!(path: ReentrancyGuardComponent, storage: reentrancy_guard, event: ReentrancyGuardEvent);
+
+    #[abi(embed_v0)]
+    impl OwnableMixinImpl = OwnableComponent::OwnableMixinImpl<ContractState>;
+    impl OwnableInternalImpl = OwnableComponent::InternalImpl<ContractState>;
+    impl ReentrancyGuardInternalImpl = ReentrancyGuardComponent::InternalImpl<ContractState>;
+ 
+    #[storage]
+    pub struct Storage {
+        #[substorage(v0)]
+        pub ownable: OwnableComponent::Storage,
+        #[substorage(v0)]
+        reentrancy_guard: ReentrancyGuardComponent::Storage,
+        scavenger_token: ContractAddress,
+        wastes: Map<u256, Waste>,
+        waste_transfer_history: Map<u256, Vec<TransferRecord>>,
+        participants: Map<ContractAddress, Participant>,
+        participant_wastes: Map<ContractAddress, Vec<u256>>,
+        incentive: Map<u256, Incentive>,
+        rewarder_incentives: Map<ContractAddress, Vec<u256>>,
+        general_incentives: Vec<u256>, 
+        next_waste_id: u256,
+        charity_contract: ContractAddress,
+        next_incentive_id: u256,
+        collector_percentage: u256,
+        owner_percentage: u256,
+        total_tokens_earned: u256,
+    }
+
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    enum Event {
+        WasteRecycled: WasteRecycled,
+        WasteTransferred: WasteTransferred,
+        ParticipantRegistered: ParticipantRegistered,
+        TokensRewarded: TokensRewarded,
+        DonationMade: DonationMade,
+        WasteConfirmed: WasteConfirmed,
+        IncentiveSet: IncentiveSet,
+        #[flat]
+        ReentrancyGuardEvent: ReentrancyGuardComponent::Event,
+        #[flat]
+        OwnableEvent: OwnableComponent::Event,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct WasteRecycled {
+        #[key]
+        waste_id: u256,
+        #[key]
+        recycler: ContractAddress,
+        waste_type: WasteType,
+        weight: u256,
+        latitude: i128,
+        longitude: i128,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct WasteTransferred {
+        #[key]
+        waste_id: u256,
+        #[key]
+        from: ContractAddress,
+        #[key]
+        to: ContractAddress,
+        latitude: i128,
+        longitude: i128,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ParticipantRegistered {
+        #[key]
+        participant: ContractAddress,
+        role: ParticipantRole,
+        name: felt252,
+        latitude: i128,
+        longitude: i128,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct TokensRewarded {
+        #[key]
+        recipient: ContractAddress,
+        amount: u256,
+        #[key]
+        waste_id: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct DonationMade {
+        #[key]
+        donor: ContractAddress,
+        amount: u256,
+        charity_contract: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct WasteConfirmed {
+        #[key]
+        waste_id: u256,
+        #[key]
+        confirmer: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct IncentiveSet {
+        #[key]
+        rewarder: ContractAddress,
+        waste_type: WasteType,
+        price: u256,
+        max_amount: u256,
+    }
+
+    #[constructor]
+    fn constructor(ref self: ContractState, scavenger_token: ContractAddress, owner: ContractAddress, charity_contract: ContractAddress) {
+        self.scavenger_token.write(scavenger_token);
+        self.charity_contract.write(charity_contract);
+        self.next_waste_id.write(1_u256);
+        self.next_incentive_id.write(1_u256);
+        self.collector_percentage.write(5_u256);
+        self.owner_percentage.write(5_u256 / 10_u256);
+        self.total_tokens_earned.write(0_u256);
+        
+        // Initialize Ownable
+        self.ownable.initializer(owner);
+    }
+   
+    #[abi(embed_v0)]
+    impl WasteSupplyChain of super::IWasteSupplyChain<ContractState> {
+        fn register_participant(
+            ref self: ContractState,
+            role: ParticipantRole,
+            name: felt252,
+            latitude: i128,
+            longitude: i128
+        ) {
+            let caller = get_caller_address();
+            assert(!self.participants.read(caller).is_registered, 'Already registered');
+
+            let participant = Participant {
+                role,
+                name,
+                latitude,
+                longitude,
+                is_registered: true,
+                total_waste_processed: 0_u256,
+                total_tokens_earned: 0_u256,
+            };
+
+            self.participants.entry(caller).write(participant);
+            self.emit(Event::ParticipantRegistered(ParticipantRegistered {
+                participant: caller,
+                role: participant.role,
+                name: participant.name,
+                latitude: participant.latitude,
+                longitude: participant.longitude,
+            }));
+        }
+
+        fn set_incentive(
+            ref self: ContractState,
+            waste_type: WasteType,
+            reward: u256,
+            max_amount: u256
+        ) {
+            InternalFunctions::only_manufacturer(@self);
+            InternalFunctions::only_registered(@self);
+            assert!(reward > 0, "Reward must be greater than 0.");
+            assert!(max_amount > 0, "Max Amount must be greater than 0.");
+
+            let incentive_id = self.next_incentive_id.read();
+            let caller = get_caller_address();
+
+            let incentive = Incentive {
+                waste_type,
+                reward,
+                max_waste_amount: max_amount,
+                rewarder: caller,
+                is_active: true,
+            };
+
+            self.incentive.entry(incentive_id).write(incentive);
+            
+            self.rewarder_incentives.entry(caller).push(incentive_id);
+
+            self.general_incentives.push(incentive_id);
+
+            self.next_incentive_id.write(incentive_id + 1_u256);
+            self.emit(Event::IncentiveSet(IncentiveSet {
+                rewarder: caller,
+                waste_type: incentive.waste_type,
+                price: incentive.reward,
+                max_amount: incentive.max_waste_amount,
+            }));
+        }
+
+        fn update_incentive(
+            ref self: ContractState,
+            incentive_id: u256,
+            new_reward: u256,
+            new_max_amount: u256
+        ) {
+            InternalFunctions::only_manufacturer(@self);
+            InternalFunctions::only_registered(@self);
+
+            let caller = get_caller_address();
+            let mut incentive = self.incentive.read(incentive_id);
+            assert(incentive.rewarder == caller, 'Not incentive owner');
+            assert(incentive.is_active, 'Incentive not active');
+
+            assert!(new_reward > 0, "Reward must be greater than 0.");
+            assert!(new_max_amount > 0, "Max Amount must be greater than 0.");
+
+            let new_incentive = Incentive {
+                waste_type: incentive.waste_type,
+                reward: new_reward,
+                max_waste_amount: new_max_amount,
+                rewarder: caller,
+                is_active: true,
+            };
+
+            self.incentive.entry(incentive_id).write(new_incentive);
+            self.emit(Event::IncentiveSet(IncentiveSet {
+                rewarder: caller,
+                waste_type: incentive.waste_type,
+                price: new_reward,
+                max_amount: new_max_amount,
+            }));
+        }
+
+        fn deactivate_incentive(ref self: ContractState, incentive_id: u256) {
+            InternalFunctions::only_manufacturer(@self);
+            InternalFunctions::only_registered(@self);
+
+            let caller = get_caller_address();
+            let mut incentive = self.incentive.read(incentive_id);
+            assert(incentive.rewarder == caller, 'Not incentive owner');
+            assert(incentive.is_active, 'Already inactive');
+
+            incentive.is_active = false;
+
+            self.incentive.entry(incentive_id).write(incentive);
+        }
+
+        fn recycle_waste(
+            ref self: ContractState,
+            waste_type: WasteType,
+            weight: u256,
+            latitude: i128,
+            longitude: i128
+        ) -> u256 {
+            InternalFunctions::only_registered(@self);
+
+            let caller = get_caller_address();
+            let participant_info = self.participants.entry(caller).read();
+            
+            assert(participant_info.role == ParticipantRole::RECYCLER, 'You cant initiate waste');
+                                                                                    
+            assert!(weight > 0, "Weight must be greater than 0.");
+
+            let waste_id = self.next_waste_id.read();
+
+            let waste = Waste {
+                waste_id,
+                waste_type,
+                weight,
+                current_owner: caller,
+                latitude,
+                longitude,
+                recycled_timestamp: get_block_timestamp(),
+                is_active: true,
+                is_confirmed: false,
+                confirmer: contract_address_const::<0x0>().try_into().unwrap(),
+            };
+
+            self.wastes.entry(waste_id).write(waste);
+
+            self.participant_wastes.entry(caller).push(waste_id);
+
+            let transfer_record = TransferRecord {
+                waste_id,
+                from: contract_address_const::<0x0>().try_into().unwrap(),
+                to: caller,
+                timestamp: get_block_timestamp(),
+                latitude, 
+                longitude, 
+                notes: 'Initial recycling',
+            };
+
+            self.waste_transfer_history.entry(waste_id).push(transfer_record);
+
+            self.next_waste_id.write(waste_id + 1_u256);
+            self.emit(Event::WasteRecycled(WasteRecycled {
+                waste_id: waste.waste_id,
+                recycler: waste.current_owner,
+                waste_type: waste.waste_type,
+                weight: waste.weight,
+                latitude: waste.latitude,
+                longitude: waste.longitude,
+            }));
+
+            self.emit(Event::WasteTransferred(WasteTransferred{
+                waste_id: transfer_record.waste_id,
+                from: transfer_record.from,
+                to: transfer_record.to,
+                latitude: transfer_record.latitude,
+                longitude: transfer_record.longitude,
+            }));
+
+            waste_id
+        }
+
+        fn confirm_waste_details(ref self: ContractState, waste_id: u256) {
+            InternalFunctions::waste_exists(@self, waste_id);
+            InternalFunctions::only_registered(@self);
+
+            let caller = get_caller_address();
+            let mut waste = self.wastes.entry(waste_id).read();
+
+            assert(waste.current_owner != caller, 'Owner cannot confirm');
+            assert(!waste.is_confirmed, 'Already confirmed');
+
+            waste.is_confirmed = true;
+            waste.confirmer = caller;
+
+            self.wastes.entry(waste_id).write(waste);
+            self.emit(Event::WasteConfirmed(WasteConfirmed {
+                waste_id: waste_id,
+                confirmer: caller,
+            }));
+        }
+
+        fn reset_waste_details(ref self: ContractState, waste_id: u256) {
+            InternalFunctions::waste_exists(@self, waste_id);
+            InternalFunctions::only_registered(@self);
+            InternalFunctions::only_waste_owner(@self, waste_id);
+
+            let mut waste = self.wastes.entry(waste_id).read();
+
+            waste.is_confirmed = false;
+            waste.confirmer = contract_address_const::<0x0>().try_into().unwrap();
+
+            self.wastes.entry(waste_id).write(waste);
+            
+            self.emit(Event::WasteConfirmed(WasteConfirmed {
+                waste_id,
+                confirmer: get_caller_address(),
+            }));
+        }
+
+        fn deactivate_waste(ref self: ContractState, waste_id: u256) {
+            self.ownable.assert_only_owner();
+            InternalFunctions::waste_exists(@self, waste_id);
+
+            let mut waste = self.wastes.entry(waste_id).read();
+            waste.is_active = false;
+
+            self.wastes.entry(waste_id).write(waste);
+        }
+
+        fn transfer_waste(
+            ref self: ContractState,
+            waste_id: u256,
+            to: ContractAddress,
+            latitude: i128,
+            longitude: i128,
+            notes: felt252
+        ) {
+            InternalFunctions::only_registered(@self);
+            InternalFunctions::waste_exists(@self, waste_id);
+            InternalFunctions::only_waste_owner(@self, waste_id);
+
+            let caller = get_caller_address();
+            let mut waste = self.wastes.entry(waste_id).read();
+            let mut to_participant = self.participants.entry(to).read();
+            
+            assert(to_participant.is_registered, 'Recipient not registered');
+            assert(to != caller, 'Cannot transfer to yourself');
+
+            assert(waste.is_confirmed , 'Waste details is not confirmed');
+            assert(waste.confirmer == to , 'To addr isnt confirmer');
+
+            assert(InternalFunctions::is_valid_transfer(@self, self.participants.entry(caller).read().role, to_participant.role), 'Invalid transfer');
+
+            let previous_owner = waste.current_owner;
+
+            //update Waste
+            waste.current_owner = to;
+            waste.is_confirmed = false;
+            waste.confirmer = contract_address_const::<0x0>().try_into().unwrap();
+
+            self.participant_wastes.entry(to).push(waste_id);
+            to_participant.total_waste_processed += waste.weight;
+
+           
+
+            let transfer_record = TransferRecord {
+                waste_id,
+                from: previous_owner,
+                to,
+                timestamp: get_block_timestamp(),
+                latitude,
+                longitude,
+                notes,
+            };
+
+            self.waste_transfer_history.entry(waste_id).push(transfer_record);
+
+            //add remove waste from previous owner array
+            self._remove_waste_from_participant(previous_owner, waste_id);
+
+            self.emit(Event::WasteTransferred(WasteTransferred{
+                waste_id: transfer_record.waste_id,
+                from: transfer_record.from,
+                to: transfer_record.to,
+                latitude: transfer_record.latitude,
+                longitude: transfer_record.longitude,
+                        }));
+
+            let participant_info = self.participants.entry(to).read();
+
+            if participant_info.role == ParticipantRole::MANUFACTURER{
+                self._reward_tokens(waste_id);
+            }
+
+        }
+
+        fn transfer_collected_waste(
+            ref self: ContractState,
+            waste_type: WasteType,
+            to: ContractAddress,
+            latitude: i128,
+            longitude: i128,
+            notes: felt252
+        ) {
+            InternalFunctions::only_registered(@self);
+
+            let caller = get_caller_address();
+            
+            let waste_ids_len = self.participant_wastes.entry(caller).len();
+
+            for i in 0..waste_ids_len {
+                let waste_id = self.participant_wastes.entry(caller).at(i).read();
+                let waste = self.wastes.read(waste_id);
+
+                if waste.waste_type == waste_type{
+                    self.transfer_waste(waste_id, to, latitude, longitude, notes);
+                }
+            };
+
+        }
+
+        fn donate_to_charity(ref self: ContractState, amount: u256) {
+            InternalFunctions::only_registered(@self);
+            self.reentrancy_guard.start();  // Start reentrancy protection
+            
+            let caller = get_caller_address();
+            let charity = self.charity_contract.read();
+            assert(!charity.is_zero(), 'Charity not set');
+            
+            let token = IERC20Dispatcher { contract_address: self.scavenger_token.read() };
+            assert(token.balance_of(caller) >= amount, 'Insufficient balance');
+            
+            token.transfer_from(caller, charity, amount);
+            
+            self.emit(Event::DonationMade(DonationMade {
+                donor: caller,
+                amount: amount,
+                charity_contract: charity,
+            }));
+            
+            self.reentrancy_guard.end();  // End reentrancy protection
+        }
+
+        fn set_charity_contract(ref self: ContractState, new_charity: ContractAddress) {
+            self.ownable.assert_only_owner();
+            self.charity_contract.write(new_charity);
+        }
+
+        fn set_percentage(ref self: ContractState, owner_percent: u256, collector_percent: u256) {
+            self.ownable.assert_only_owner();
+            assert(owner_percent + collector_percent <= 100_u256, 'Invalid percentages');
+            
+            self.owner_percentage.write(owner_percent);
+            self.collector_percentage.write(collector_percent);
+        }
+
+        fn get_waste(self: @ContractState, waste_id: u256) -> Waste {
+            self.wastes.entry(waste_id).read()
+        }
+
+        fn get_participant_wastes(self: @ContractState, participant: ContractAddress) -> Array<Waste> {
+            let mut all_wastes = array![];
+
+            let caller = get_caller_address();
+            
+            let waste_ids = self.participant_wastes.entry(caller);
+            let waste_ids_len = waste_ids.len();
+
+            for i in 0..waste_ids_len {
+                let waste_id = self.participant_wastes.entry(caller).at(i).read();
+                let waste = self.wastes.entry(waste_id).read();
+
+                all_wastes.append(waste);
+            };
+            all_wastes
+        }
+
+        fn get_waste_transfer_history(self: @ContractState, waste_id: u256) -> Array<TransferRecord> {
+            let mut waste_transfer_history = array![];
+
+            let waste_history = self.waste_transfer_history.entry(waste_id);
+            let waste_history_len = waste_history.len();
+
+            for i in 0..waste_history_len {
+                let history = self.waste_transfer_history.entry(waste_id).at(i).read();
+
+                waste_transfer_history.append(history);
+            };
+
+            waste_transfer_history
+
+        }
+
+        fn get_participant_info(self: @ContractState, participant: ContractAddress) -> Participant {
+            self.participants.entry(participant).read()
+        }
+
+        fn get_incentives(self: @ContractState, waste_type: WasteType) -> Array<Incentive> {
+            let mut incentive_array = array![];
+
+            let incentive_len = self.general_incentives.len();
+
+            for i in 0..incentive_len {
+                let incentive_id = self.general_incentives.at(i).read();
+                let incentive = self.incentive.entry(incentive_id).read();
+
+                if incentive.is_active && incentive.waste_type == waste_type {
+                    incentive_array.append(incentive);
+                }
+            };
+            incentive_array
+        }
+
+        fn get_incentive(self: @ContractState, incentive_id: u256) -> Incentive {
+            self.incentive.entry(incentive_id).read()
+        }
+
+        fn get_manufacturer_incentive(
+            self: @ContractState, 
+            manufacturer: ContractAddress, 
+            waste_type: WasteType
+        ) -> Array<Incentive> {
+            let mut incentive_array = array![];
+
+            let incentive_len = self.rewarder_incentives.entry(manufacturer).len();
+            
+            for i in 0..incentive_len {
+                let incentive_id = self.rewarder_incentives.entry(manufacturer).at(i).read();
+                let incentive = self.incentive.entry(incentive_id).read();
+
+                if incentive.is_active && incentive.waste_type == waste_type {
+                    incentive_array.append(incentive);
+                }
+            }
+
+            incentive_array
+        }
+
+        fn get_metrics(self: @ContractState) -> (u256, u256) {
+            (self.next_waste_id.read() - 1_u256, self.total_tokens_earned.read())
+        }
+
+        fn get_waste_type_string(self: @ContractState, waste_type: WasteType) -> ByteArray {
+            match waste_type {
+                WasteType::PAPER => "PAPER",
+                WasteType::PETPLASTIC => "PETPLASTIC",
+                WasteType::PLASTIC => "PLASTIC",
+                WasteType::METAL => "METAL",
+                WasteType::GLASS => "GLASS",
+                _ => "UNKNOWN",
+            }
+        }
+
+        fn get_participant_role_string(self: @ContractState, role: ParticipantRole) -> ByteArray {
+            match role {
+                ParticipantRole::RECYCLER => "RECYCLER",
+                ParticipantRole::COLLECTOR => "COLLECTOR",
+                ParticipantRole::MANUFACTURER => "MANUFACTURER",
+                _ => "UNKNOWN",
+            }
+        }
+
+        fn get_supply_chain_stats(self: @ContractState) -> (u256, u256, u256) {
+            let total_wastes = self.next_waste_id.read() - 1_u256;
+            let mut total_weight = 0_u256;
+
+            for i in 1_u256..self.next_waste_id.read() {
+                let waste = self.wastes.entry(i).read();
+                if waste.is_active {
+                    total_weight += waste.weight;
+                }
+            }
+            let total_token_earned = self.total_tokens_earned.read();
+            (total_wastes, total_weight, total_token_earned)
+        }
+
+    }
+
+    #[generate_trait]
+    impl InternalFunctions of InternalFunctionsTrait {
+        fn only_registered(self: @ContractState) {
+            let caller = get_caller_address();
+            assert(self.participants.read(caller).is_registered, 'Not registered');
+        }
+
+        fn only_manufacturer(self: @ContractState) {
+            let caller = get_caller_address();
+            assert(self.participants.read(caller).role == ParticipantRole::MANUFACTURER, 'Not manufacturer');
+        }
+
+        fn waste_exists(self: @ContractState, waste_id: u256) {
+            assert(waste_id < self.next_waste_id.read(), 'Waste does not exist');
+            assert(self.wastes.read(waste_id).is_active, 'Waste not active');
+        }
+
+        fn only_waste_owner(self: @ContractState, waste_id: u256) {
+            assert(self.wastes.read(waste_id).current_owner == get_caller_address(), 'Not waste owner');
+        }
+
+        fn is_valid_transfer(self: @ContractState, from: ParticipantRole, to: ParticipantRole) -> bool {
+            match from {
+                ParticipantRole::RECYCLER => to == ParticipantRole::COLLECTOR || to == ParticipantRole::MANUFACTURER,
+                ParticipantRole::COLLECTOR => to == ParticipantRole::COLLECTOR || to == ParticipantRole::MANUFACTURER,
+                _ => false,
+            }
+        }
+
+        fn _remove_waste_from_participant(ref self: ContractState, participant: ContractAddress, waste_id: u256) {
+            let mut wastes_len = self.participant_wastes.entry(participant).len();
+            
+            for i in 0..wastes_len {
+                let _waste_id = self.participant_wastes.entry(participant).at(i).read();
+                
+                if _waste_id == waste_id {
+                    self.participant_wastes.entry(participant).at(i).write(0_u256);
+                }
+            };
+        }
+
+        fn _reward_tokens(ref self: ContractState, waste_id: u256) {
+            // Get waste details and history
+            let history = self.waste_transfer_history.entry(waste_id);
+            let waste = self.wastes.read(waste_id);
+            let weight = waste.weight;
+            let waste_type = waste.waste_type;
+            let manufacturer = waste.current_owner;
+            
+            // Get incentive details
+            let incentive = self.get_manufacturer_incentive(manufacturer, waste_type);
+            let total_reward = incentive[0].reward * weight;
+            let mut current_reward = total_reward;
+            
+            // Update total tokens earned
+            self.total_tokens_earned.write(self.total_tokens_earned.read() + total_reward);
+            
+            // Get percentages
+            let collector_percentage = self.collector_percentage.read();
+            let owner_percentage = self.owner_percentage.read();
+            
+            // Get token contract
+            let token = IERC20Dispatcher { 
+                contract_address: self.scavenger_token.read() 
+            };
+            
+            // Process rewards
+            for i in 1..history.len() {
+                let record = history.at(i).read();
+                let participant = record.to;
+                
+                // Calculate shares
+                let collector_share = (current_reward * collector_percentage) / 100_u256;
+                let owner_share = (current_reward * owner_percentage) / 100_u256;
+                
+                // Transfer tokens
+                token.transfer_from(manufacturer, participant, collector_share);
+                token.transfer_from(manufacturer, self.get_owner(), owner_share);
+                
+                // Update rewards
+                current_reward -= collector_share + owner_share;
+                
+                // Update participant stats
+                let mut participant_info = self.participants.entry(participant).read();
+                participant_info.total_tokens_earned += collector_share;
+                self.participants.entry(participant).write(participant_info);
+                
+                // Emit reward events
+                self.emit(Event::TokensRewarded(TokensRewarded {
+                    recipient: participant,
+                    amount: collector_share,
+                    waste_id: waste_id,
+                }));
+                self.emit(Event::TokensRewarded(TokensRewarded {
+                    recipient: self.get_owner(),
+                    amount: owner_share,
+                    waste_id: waste_id,
+                }));
+                
+            }
+
+            // Reward recycler
+            let recycler = history.at(0).read();
+            let recycler_reward = current_reward;
+            
+            if recycler_reward > 0 {
+                // Transfer tokens to recycler
+                token.transfer_from(manufacturer, recycler, recycler_reward);
+                
+                // Update recycler stats
+                let mut recycler_info = self.participants.entry(recycler).read();
+                recycler_info.total_tokens_earned += recycler_reward;
+                self.participants.entry(recycler).write(recycler_info);
+                
+                // Emit recycler reward event
+                self.emit(Event::TokensRewarded(TokensRewarded {
+                    recipient: recycler,
+                    amount: recycler_reward,
+                    waste_id: waste_id,
+                }));
+            }
+        }
+
+        // Function to retrieve the current owner
+        fn get_owner(self: @ContractState) -> ContractAddress {
+            self.ownable.owner()
+        }
+    }
+
+}
