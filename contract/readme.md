@@ -17,7 +17,7 @@ A StarkNet smart contract for managing a waste recycling supply chain, tracking 
 - [OpenZeppelin](https://www.openzeppelin.com/) (ERC20, Ownable, ReentrancyGuard)
 
 ## Contract Address
-- **Waste Supply Chain Contract**: [0x05625aa9f33fbb35af36fdaf5931b43fc0bfdc0364e32f9410e50b875b26556a](https://sepolia.voyager.online/contract/0x05625aa9f33fbb35af36fdaf5931b43fc0bfdc0364e32f9410e50b875b26556a)
+- **Waste Supply Chain Contract**: [0x04d34b9f1034346e92505e0ca90375be1bbc6c6a814a804eab09f753fde07f43](https://sepolia.voyager.online/contract/0x04d34b9f1034346e92505e0ca90375be1bbc6c6a814a804eab09f753fde07f43)
 
 - **Scavenger Token Contract**: [0x05625aa9f33fbb35af36fdaf5931b43fc0bfdc0364e32f9410e50b875b26556a](https://sepolia.voyager.online/contract/0x05625aa9f33fbb35af36fdaf5931b43fc0bfdc0364e32f9410e50b875b26556a)
 
