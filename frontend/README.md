@@ -184,7 +184,10 @@ COPY . .
 RUN npm run build
 EXPOSE 3000
 CMD ["npm", "start"]
+
 ```
+## Figma Link
+https://www.figma.com/design/8I1t0lqvNgFcghXVOudjpv/Scavenger?node-id=0-1&p=f&t=t3xkskC0GY7Ns9qg-0
 
 ## 🤝 Contributing
 
